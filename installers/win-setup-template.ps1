@@ -63,14 +63,23 @@ function Get-ExecParams {
     param(
         [Parameter(Mandatory)][Boolean] $IsMSI,
         [Parameter(Mandatory)][Boolean] $IsFreeThreaded,
-        [Parameter(Mandatory)][String] $PythonArchPath
+        [Parameter(Mandatory)][String] $PythonArchPath,
+        [Parameter()][Boolean] $IncludeDebug = $false,
+        [Parameter()][Boolean] $IncludeDev = $false,
+        [Parameter()][Boolean] $IncludeLib = $false,
+        [Parameter()][Boolean] $CompileAll = $false
     )
+    $Include_debug = if ($IncludeDebug) { "Include_debug=1" } else { "" }
+    $Include_dev = if ($IncludeDev) { "Include_dev=1" } else { "" }
+    $Include_lib = if ($IncludeLib) { "Include_lib=1" } else { "" }
+    $Compile_all = if ($CompileAll) { "CompileAll=1" } else { "" }
 
     if ($IsMSI) {
-        "TARGETDIR=$PythonArchPath ALLUSERS=1"
+        "TARGETDIR=$PythonArchPath ALLUSERS=1 $Include_debug $Include_dev $Include_lib $Compile_all"
     } else {
         $Include_freethreaded = if ($IsFreeThreaded) { "Include_freethreaded=1" } else { "" }
-        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded"
+        $Debug_mode = if ($DebugMode) { "Debug_Mode=1" } else { "" }
+        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded $Include_debug $Include_dev $Include_lib $Compile_all"
     }
 }
 
@@ -157,3 +166,12 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Create complete file"
 New-Item -ItemType File -Path $PythonVersionPath -Name "$Architecture.complete" | Out-Null
+
+# Example usage
+$ExecParams = Get-ExecParams -IsMSI:$IsMSI -IsFreeThreaded:$IsFreeThreaded -DebugMode:$DebugMode -PythonArchPath:$PythonArchPath -IncludeDebug:$true -IncludeDev:$true -IncludeLib:$true -CompileAll:$true
+Write-Host "Execution Parameters: $ExecParams"
+
+# Pass $ExecParams to the Python setup executable
+$SetupCommand = "setup.exe /quiet $ExecParams"
+Write-Host "Running setup command: $SetupCommand"
+Invoke-Expression $SetupCommand
