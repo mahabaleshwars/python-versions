@@ -91,7 +91,7 @@ if (-Not (Test-Path $PythonToolcachePath)) {
 }
 
 Write-Host "Check if current Python version is installed..."
-$InstalledVersions = Get-Item "$PythonToolcachePath\$MajorVersion.$MinorVersion.*\$Architecture"
+$InstalledVersions = Get-Item "$PythonToolcachePath\$MajorVersion.$MinorVersion.*\$Architecture" -ErrorAction SilentlyContinue
 
 if ($null -ne $InstalledVersions) {
     Write-Host "Python$MajorVersion.$MinorVersion ($Architecture) was found in $PythonToolcachePath..."
@@ -208,8 +208,8 @@ $pythonExe = if ($IsFreeThreaded) {
 
 if (-Not (Test-Path $pythonExe)) {
     Write-Host "Warning: Python executable not found at expected location: $pythonExe"
-    Write-Host "Contents of $PythonArchPath:"
-    Get-ChildItem -Path $PythonArchPath | ForEach-Object { Write-Host "  $_" }
+    Write-Host "Contents of ${PythonArchPath}:"  # FIX: Use ${} to properly delimit the variable
+    Get-ChildItem -Path $PythonArchPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
 }
 
 if ($IsFreeThreaded) {
