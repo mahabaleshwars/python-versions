@@ -11,12 +11,7 @@ function Get-RegistryVersionFilter {
     )
 
     $archFilter = if ($Architecture -eq 'x86') { "32-bit" } else { "64-bit" }
-    ### Python 2.7 x86 have no architecture postfix
-    if (($Architecture -eq "x86") -and ($MajorVersion -eq 2)) {
-        "Python $MajorVersion.$MinorVersion.\d+$"
-    } else {
-        "Python $MajorVersion.$MinorVersion.*($archFilter)"
-    }
+    "Python $MajorVersion.$MinorVersion.*($archFilter)"
 }
 
 function Remove-RegistryEntries {
@@ -63,23 +58,14 @@ function Get-ExecParams {
     param(
         [Parameter(Mandatory)][Boolean] $IsMSI,
         [Parameter(Mandatory)][Boolean] $IsFreeThreaded,
-        [Parameter(Mandatory)][String] $PythonArchPath,
-        [Parameter()][Boolean] $IncludeDebug = $false,
-        [Parameter()][Boolean] $IncludeDev = $false,
-        [Parameter()][Boolean] $IncludeLib = $false,
-        [Parameter()][Boolean] $CompileAll = $false
+        [Parameter(Mandatory)][String] $PythonArchPath
     )
-    $Include_debug = if ($IncludeDebug) { "Include_debug=1" } else { "" }
-    $Include_dev = if ($IncludeDev) { "Include_dev=1" } else { "" }
-    $Include_lib = if ($IncludeLib) { "Include_lib=1" } else { "" }
-    $Compile_all = if ($CompileAll) { "CompileAll=1" } else { "" }
 
     if ($IsMSI) {
-        "TARGETDIR=$PythonArchPath ALLUSERS=1 $Include_debug $Include_dev $Include_lib $Compile_all"
+        "TARGETDIR=$PythonArchPath ALLUSERS=1"
     } else {
         $Include_freethreaded = if ($IsFreeThreaded) { "Include_freethreaded=1" } else { "" }
-        $Debug_mode = if ($DebugMode) { "Debug_Mode=1" } else { "" }
-        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded $Include_debug $Include_dev $Include_lib $Compile_all"
+        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded"
     }
 }
 
@@ -135,15 +121,28 @@ Copy-Item -Path ./$PythonExecName -Destination $PythonArchPath | Out-Null
 Write-Host "Install Python $Version in $PythonToolcachePath..."
 $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
 
-cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
-if ($LASTEXITCODE -ne 0) {
-    Throw "Error happened during Python installation"
-}
+# FIX: Special handling ONLY for Windows ARM64 free-threaded builds
+# Check if we're on Windows AND ARM64 hardware AND installing free-threaded version
+$IsWindowsARM64FreeThreaded = ($HardwareArchitecture -eq "ARM64") -and $IsFreeThreaded -and ($Architecture -eq "arm64-freethreaded")
 
-# print out all files in $PythonArchPath
-Write-Host "Files in $PythonArchPath"
-$files = Get-ChildItem -Path $PythonArchPath -File -Recurse
-Write-Output $files
+if ($IsWindowsARM64FreeThreaded) {
+    # Use Start-Process for Windows ARM64 free-threaded builds only
+    # This ensures the installer respects the target directory on Windows ARM64
+    $InstallerPath = Join-Path -Path $PythonArchPath -ChildPath $PythonExecName
+    $ArgumentList = "$ExecParams /quiet"
+    
+    Write-Host "Using special installation method for Windows ARM64 free-threaded build..."
+    $process = Start-Process -FilePath $InstallerPath -ArgumentList $ArgumentList -Wait -PassThru -WorkingDirectory $PythonArchPath
+    if ($process.ExitCode -ne 0) {
+        Throw "Error happened during Python installation. Exit code: $($process.ExitCode)"
+    }
+} else {
+    # Original installation method for all other cases (x64, x86, non-free-threaded ARM64)
+    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
+    if ($LASTEXITCODE -ne 0) {
+        Throw "Error happened during Python installation"
+    }
+}
 
 if ($IsFreeThreaded) {
     # Delete python.exe and create a symlink to free-threaded exe
@@ -152,9 +151,7 @@ if ($IsFreeThreaded) {
 }
 
 Write-Host "Create `python3` symlink"
-if ($MajorVersion -ne "2") {
-    New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
-}
+New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
 
 Write-Host "Install and upgrade Pip"
 $Env:PIP_ROOT_USER_ACTION = "ignore"
@@ -166,12 +163,3 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Create complete file"
 New-Item -ItemType File -Path $PythonVersionPath -Name "$Architecture.complete" | Out-Null
-
-# Example usage
-$ExecParams = Get-ExecParams -IsMSI:$IsMSI -IsFreeThreaded:$IsFreeThreaded -DebugMode:$DebugMode -PythonArchPath:$PythonArchPath -IncludeDebug:$true -IncludeDev:$true -IncludeLib:$true -CompileAll:$true
-Write-Host "Execution Parameters: $ExecParams"
-
-# Pass $ExecParams to the Python setup executable
-$SetupCommand = "setup.exe /quiet $ExecParams"
-Write-Host "Running setup command: $SetupCommand"
-Invoke-Expression $SetupCommand
