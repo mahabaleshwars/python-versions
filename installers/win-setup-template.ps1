@@ -12,6 +12,7 @@ function Get-RegistryVersionFilter {
 
     $archFilter = if ($Architecture -eq 'x86') { "32-bit" } else { "64-bit" }
     "Python $MajorVersion.$MinorVersion.*($archFilter)"
+    "Python $MajorVersion.$MinorVersion.*($archFilter)"
 }
 
 function Remove-RegistryEntries {
@@ -151,6 +152,7 @@ if ($IsFreeThreaded) {
 }
 
 Write-Host "Create `python3` symlink"
+New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
 New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
 
 Write-Host "Install and upgrade Pip"
