@@ -10,7 +10,15 @@ function Get-RegistryVersionFilter {
         [Parameter(Mandatory)][Int32] $MinorVersion
     )
 
-    $archFilter = if ($Architecture -eq 'x86') { "32-bit" } else { "64-bit" }
+    # FIX: Be more specific about architecture in registry filter
+    if ($Architecture -eq 'x86') {
+        $archFilter = "32-bit"
+    } elseif ($Architecture -eq 'arm64' -or $Architecture -eq 'arm64-freethreaded') {
+        $archFilter = "ARM64"
+    } else {
+        $archFilter = "64-bit"
+    }
+    
     "Python $MajorVersion.$MinorVersion.*($archFilter)"
 }
 
@@ -21,7 +29,8 @@ function Remove-RegistryEntries {
         [Parameter(Mandatory)][Int32] $MinorVersion
     )
 
-    $versionFilter = Get-RegistryVersionFilter -Architecture $HardwareArchitecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
+    # CRITICAL FIX: Use the actual architecture for registry cleanup, not hardware architecture
+    $versionFilter = Get-RegistryVersionFilter -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
 
     $regPath = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products"
     if (Test-Path -Path Registry::$regPath) {
@@ -52,6 +61,22 @@ function Remove-RegistryEntries {
             Remove-Item Registry::$_ -Recurse -Force -Verbose
         }
     }
+    
+    # ADDITIONAL FIX: Clear Python-specific registry keys for the specific architecture
+    $pythonRegPaths = @(
+        "HKLM:\SOFTWARE\Python\PythonCore\$MajorVersion.$MinorVersion-arm64",
+        "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore\$MajorVersion.$MinorVersion-arm64",
+        "HKCU:\SOFTWARE\Python\PythonCore\$MajorVersion.$MinorVersion-arm64"
+    )
+    
+    if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
+        foreach ($regPath in $pythonRegPaths) {
+            if (Test-Path $regPath) {
+                Write-Host "Removing ARM64-specific registry path: $regPath"
+                Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Get-ExecParams {
@@ -67,6 +92,19 @@ function Get-ExecParams {
         $Include_freethreaded = if ($IsFreeThreaded) { "Include_freethreaded=1" } else { "" }
         "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded"
     }
+}
+
+function Clear-InstallerCache {
+    Write-Host "Clearing Windows Installer cache..."
+    
+    # Clear any pending installer operations
+    Stop-Process -Name msiexec -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    
+    # Restart Windows Installer service to clear any cached state
+    Write-Host "Restarting Windows Installer service..."
+    Restart-Service -Name msiserver -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
 }
 
 $ToolcacheRoot = $env:AGENT_TOOLSDIRECTORY
@@ -112,6 +150,11 @@ if ($null -ne $InstalledVersions) {
 Write-Host "Remove registry entries for Python ${MajorVersion}.${MinorVersion}(${Architecture})..."
 Remove-RegistryEntries -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
 
+# CRITICAL FIX: Clear installer cache when installing ARM64 after x64
+if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
+    Clear-InstallerCache
+}
+
 Write-Host "Create Python $Version folder in $PythonToolcachePath"
 New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
 
@@ -121,44 +164,36 @@ Copy-Item -Path ./$PythonExecName -Destination $PythonArchPath | Out-Null
 Write-Host "Install Python $Version in $PythonToolcachePath..."
 $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
 
-# The key fix: Use the ORIGINAL working installation method for ALL platforms
-# The issue was introduced by trying to add special handling for ARM64
-cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
-if ($LASTEXITCODE -ne 0) {
-    # Only for ARM64, if standard installation fails, try with logging to diagnose
-    if ($HardwareArchitecture -eq "ARM64") {
-        Write-Host "Standard installation failed on ARM64. Attempting with verbose logging..."
-        
-        # Create log file path
-        $logFile = Join-Path $env:TEMP "python_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-        
-        # Try installation with logging
-        $logParams = "$ExecParams /quiet /log `"$logFile`""
-        cmd.exe /c "cd $PythonArchPath && call $PythonExecName $logParams"
-        
-        # Display last part of log for debugging
-        if (Test-Path $logFile) {
-            Write-Host "Installation log (last 50 lines):"
-            Get-Content $logFile -Tail 50 | Write-Host
-        }
-        
-        # Check if Python was actually installed despite the error
-        $pythonExe = Join-Path $PythonArchPath "python.exe"
-        if (Test-Path $pythonExe) {
-            Write-Host "Python executable found despite installation error. Continuing..."
-            $LASTEXITCODE = 0  # Reset error code
-        } else {
-            Throw "Error happened during Python installation on ARM64"
-        }
-    } else {
+# FIX: For ARM64, ensure clean environment
+if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
+    Write-Host "Installing Python for ARM64 architecture..."
+    
+    # Clear any x64 Python from PATH temporarily
+    $originalPath = $env:PATH
+    $env:PATH = $env:PATH -replace '[^;]*Python[^;]*x64[^;]*;?', ''
+    
+    # Install Python
+    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
+    $installExitCode = $LASTEXITCODE
+    
+    # Restore original PATH
+    $env:PATH = $originalPath
+    
+    if ($installExitCode -ne 0) {
+        Write-Host "Installation failed with exit code: $installExitCode"
+        Throw "Error happened during Python installation"
+    }
+} else {
+    # Standard installation for non-ARM64
+    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
+    if ($LASTEXITCODE -ne 0) {
         Throw "Error happened during Python installation"
     }
 }
 
-# Free-threaded specific handling
 if ($IsFreeThreaded) {
     # Delete python.exe and create a symlink to free-threaded exe
-    Remove-Item -Path "$PythonArchPath\python.exe" -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$PythonArchPath\python.exe" -Force
     New-Item -Path "$PythonArchPath\python.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python${MajorVersion}.${MinorVersion}t.exe"
 }
 
