@@ -121,160 +121,85 @@ Copy-Item -Path ./$PythonExecName -Destination $PythonArchPath | Out-Null
 Write-Host "Install Python $Version in $PythonToolcachePath..."
 $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
 
-# Special handling for Windows ARM64 builds - only apply to ARM64 architecture
-$IsWindowsARM64 = ($Architecture -eq "arm64") -or ($Architecture -eq "arm64-freethreaded")
-
-if ($IsWindowsARM64) {
-    Write-Host "Special handling for Windows ARM64 installation..."
+# CRITICAL FIX: Only use special ARM64 handling for non-free-threaded ARM64 builds on ARM64 hardware
+# Free-threaded builds should use the standard installation method
+if ($HardwareArchitecture -eq "ARM64" -and $Architecture -eq "arm64" -and -not $IsFreeThreaded) {
+    Write-Host "Using ARM64-specific installation for standard ARM64 build..."
     
-    # For ARM64, we need to handle the installation differently due to issues with the bundled installer
-    # The bundled installer has problems with path handling on ARM64, especially for free-threaded builds
-    
-    # Clear any existing Python registry entries that might interfere
-    Write-Host "Cleaning up any conflicting registry entries..."
-    $pythonRegPaths = @(
-        "HKLM:\SOFTWARE\Python\PythonCore\$MajorVersion.$MinorVersion-arm64",
-        "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore\$MajorVersion.$MinorVersion-arm64",
-        "HKCU:\SOFTWARE\Python\PythonCore\$MajorVersion.$MinorVersion-arm64"
-    )
-    
-    foreach ($regPath in $pythonRegPaths) {
-        if (Test-Path $regPath) {
-            Write-Host "Removing registry path: $regPath"
-            Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-    
-    # Try to install using the bundled installer with corrected parameters
+    # ARM64 standard builds need special handling
     $InstallerPath = Join-Path -Path $PythonArchPath -ChildPath $PythonExecName
     
-    # For free-threaded builds on ARM64, ensure the correct target directory
-    if ($IsFreeThreaded) {
-        Write-Host "Installing free-threaded Python for ARM64..."
-        # The installer needs to be explicitly told where to put the free-threaded version
-        $ExecParams = "TargetDir=`"$PythonArchPath`" InstallAllUsers=1 PrependPath=0 Include_freethreaded=1"
-    }
+    # Set a timeout to prevent hanging
+    $timeoutSeconds = 300  # 5 minutes timeout for installation
     
-    Write-Host "Executing installer: $InstallerPath"
-    Write-Host "Parameters: $ExecParams /quiet"
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $InstallerPath
+    $processInfo.Arguments = "$ExecParams /quiet"
+    $processInfo.UseShellExecute = $false
+    $processInfo.CreateNoWindow = $true
+    $processInfo.WorkingDirectory = $PythonArchPath
     
-    # Use Start-Process for better control and error handling
-    $process = Start-Process -FilePath $InstallerPath -ArgumentList "$ExecParams /quiet" -Wait -PassThru -NoNewWindow
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
     
-    if ($process.ExitCode -ne 0) {
-        Write-Host "Installation failed with exit code: $($process.ExitCode)"
+    Write-Host "Starting installation with timeout of $timeoutSeconds seconds..."
+    $started = $process.Start()
+    
+    if ($started) {
+        $completed = $process.WaitForExit($timeoutSeconds * 1000)
         
-        # Try alternative: Run without /quiet to see what's happening
-        Write-Host "Attempting installation with logging enabled..."
-        $logFile = Join-Path $env:TEMP "python_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-        $ExecParams = "$ExecParams /log `"$logFile`""
-        
-        $process = Start-Process -FilePath $InstallerPath -ArgumentList $ExecParams -Wait -PassThru -NoNewWindow
-        
-        if ($process.ExitCode -ne 0) {
-            if (Test-Path $logFile) {
-                Write-Host "Installation log tail (last 100 lines):"
-                Get-Content $logFile -Tail 100 | Write-Host
-            }
+        if (-not $completed) {
+            Write-Host "Installation timed out after $timeoutSeconds seconds. Terminating..."
+            $process.Kill()
+            Start-Sleep -Seconds 2
             
-            Throw "Python installation failed with exit code: $($process.ExitCode)"
-        }
-    }
-    
-    Write-Host "Installation process completed"
-    
-    # For free-threaded builds, the executables might be in a different location
-    if ($IsFreeThreaded) {
-        # Check if the free-threaded executable was installed in the wrong place
-        $possiblePaths = @(
-            (Join-Path (Split-Path $PythonArchPath -Parent) "arm64"),
-            $PythonArchPath
-        )
-        
-        foreach ($path in $possiblePaths) {
-            $pythonExe = Join-Path $path "python${MajorVersion}.${MinorVersion}t.exe"
-            if (Test-Path $pythonExe) {
-                Write-Host "Found Python executable at: $pythonExe"
-                
-                # If it's in the wrong place, move it
-                if ($path -ne $PythonArchPath) {
-                    Write-Host "Moving Python files from $path to $PythonArchPath..."
-                    Get-ChildItem -Path $path | ForEach-Object {
-                        Move-Item -Path $_.FullName -Destination $PythonArchPath -Force
-                    }
-                }
-                break
+            # Try a simpler installation approach
+            Write-Host "Attempting simpler installation command..."
+            cmd.exe /c "cd /d `"$PythonArchPath`" && start /wait `"`" `"$PythonExecName`" $ExecParams /quiet"
+            
+            # Give it a moment to complete
+            Start-Sleep -Seconds 10
+        } else {
+            $exitCode = $process.ExitCode
+            if ($exitCode -ne 0) {
+                Write-Host "Installation failed with exit code: $exitCode"
+                Throw "Python installation failed"
             }
         }
+    } else {
+        Write-Host "Failed to start installation process"
+        Throw "Could not start Python installer"
     }
 } else {
-    # Original installation method for non-ARM64
-    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
+    # Standard installation for x86, x64, and free-threaded builds
+    Write-Host "Using standard installation method..."
+    cmd.exe /c "cd `"$PythonArchPath`" && call `"$PythonExecName`" $ExecParams /quiet"
     if ($LASTEXITCODE -ne 0) {
         Throw "Error happened during Python installation"
     }
 }
 
-Write-Host "Verifying installation..."
+Write-Host "Installation completed"
 
-# Verify Python executable exists
-$pythonExe = if ($IsFreeThreaded) {
-    Join-Path -Path $PythonArchPath -ChildPath "python${MajorVersion}.${MinorVersion}t.exe"
-} else {
-    Join-Path -Path $PythonArchPath -ChildPath "python.exe"
+# Free-threaded specific handling
+if ($IsFreeThreaded) {
+    # Delete python.exe and create a symlink to free-threaded exe
+    Remove-Item -Path "$PythonArchPath\python.exe" -Force -ErrorAction SilentlyContinue
+    New-Item -Path "$PythonArchPath\python.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python${MajorVersion}.${MinorVersion}t.exe"
 }
 
-if (-Not (Test-Path $pythonExe)) {
-    Write-Host "Warning: Expected Python executable not found at: $pythonExe"
-    Write-Host "Contents of installation directory:"
-    Get-ChildItem -Path $PythonArchPath -ErrorAction SilentlyContinue | ForEach-Object { 
-        Write-Host "  $($_.Name) [$(if($_.PSIsContainer) {'DIR'} else {$_.Length})]"
-    }
-    
-    # Check parent directory for ARM64 issues
-    if ($IsWindowsARM64) {
-        $parentPath = Split-Path $PythonArchPath -Parent
-        Write-Host "Checking parent directory: $parentPath"
-        Get-ChildItem -Path $parentPath -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host "  $($_.Name) [$(if($_.PSIsContainer) {'DIR'} else {'FILE'})]"
-        }
-    }
-}
-
-if ($IsFreeThreaded -and (Test-Path $pythonExe)) {
-    # Create symlink for standard python.exe pointing to free-threaded version
-    $standardPython = Join-Path -Path $PythonArchPath -ChildPath "python.exe"
-    if (Test-Path $standardPython) {
-        Remove-Item -Path $standardPython -Force
-    }
-    Write-Host "Creating symlink: python.exe -> python${MajorVersion}.${MinorVersion}t.exe"
-    New-Item -Path $standardPython -ItemType SymbolicLink -Value $pythonExe
-}
-
-# Create python3 symlink
-$python3Path = Join-Path -Path $PythonArchPath -ChildPath "python3.exe"
-if (-Not (Test-Path $python3Path)) {
-    $targetExe = Join-Path -Path $PythonArchPath -ChildPath "python.exe"
-    if (Test-Path $targetExe) {
-        Write-Host "Creating python3.exe symlink"
-        New-Item -Path $python3Path -ItemType SymbolicLink -Value $targetExe
-    }
-}
+Write-Host "Create 'python3' symlink"
+New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
 
 Write-Host "Install and upgrade Pip"
 $Env:PIP_ROOT_USER_ACTION = "ignore"
 $PythonExePath = Join-Path -Path $PythonArchPath -ChildPath "python.exe"
-
-if (Test-Path $PythonExePath) {
-    cmd.exe /c "$PythonExePath -m ensurepip && $PythonExePath -m pip install --upgrade --force-reinstall pip --no-warn-script-location"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Warning: Pip installation/upgrade failed with exit code: $LASTEXITCODE"
-    }
-} else {
-    Write-Host "Warning: Python executable not found for pip installation at: $PythonExePath"
+cmd.exe /c "$PythonExePath -m ensurepip && $PythonExePath -m pip install --upgrade --force-reinstall pip --no-warn-script-location"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Warning: Pip installation/upgrade failed with exit code: $LASTEXITCODE"
 }
 
 Write-Host "Create complete file"
 New-Item -ItemType File -Path $PythonVersionPath -Name "$Architecture.complete" | Out-Null
 
-Write-Host "Python $Version $Architecture setup completed"
+Write-Host "Setup completed successfully"
