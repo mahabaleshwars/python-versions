@@ -121,65 +121,39 @@ Copy-Item -Path ./$PythonExecName -Destination $PythonArchPath | Out-Null
 Write-Host "Install Python $Version in $PythonToolcachePath..."
 $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
 
-# CRITICAL FIX: Only use special ARM64 handling for non-free-threaded ARM64 builds on ARM64 hardware
-# Free-threaded builds should use the standard installation method
-if ($HardwareArchitecture -eq "ARM64" -and $Architecture -eq "arm64" -and -not $IsFreeThreaded) {
-    Write-Host "Using ARM64-specific installation for standard ARM64 build..."
-    
-    # ARM64 standard builds need special handling
-    $InstallerPath = Join-Path -Path $PythonArchPath -ChildPath $PythonExecName
-    
-    # Set a timeout to prevent hanging
-    $timeoutSeconds = 300  # 5 minutes timeout for installation
-    
-    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $processInfo.FileName = $InstallerPath
-    $processInfo.Arguments = "$ExecParams /quiet"
-    $processInfo.UseShellExecute = $false
-    $processInfo.CreateNoWindow = $true
-    $processInfo.WorkingDirectory = $PythonArchPath
-    
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $processInfo
-    
-    Write-Host "Starting installation with timeout of $timeoutSeconds seconds..."
-    $started = $process.Start()
-    
-    if ($started) {
-        $completed = $process.WaitForExit($timeoutSeconds * 1000)
+# The key fix: Use the ORIGINAL working installation method for ALL platforms
+# The issue was introduced by trying to add special handling for ARM64
+cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
+if ($LASTEXITCODE -ne 0) {
+    # Only for ARM64, if standard installation fails, try with logging to diagnose
+    if ($HardwareArchitecture -eq "ARM64") {
+        Write-Host "Standard installation failed on ARM64. Attempting with verbose logging..."
         
-        if (-not $completed) {
-            Write-Host "Installation timed out after $timeoutSeconds seconds. Terminating..."
-            $process.Kill()
-            Start-Sleep -Seconds 2
-            
-            # Try a simpler installation approach
-            Write-Host "Attempting simpler installation command..."
-            cmd.exe /c "cd /d `"$PythonArchPath`" && start /wait `"`" `"$PythonExecName`" $ExecParams /quiet"
-            
-            # Give it a moment to complete
-            Start-Sleep -Seconds 10
+        # Create log file path
+        $logFile = Join-Path $env:TEMP "python_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        
+        # Try installation with logging
+        $logParams = "$ExecParams /quiet /log `"$logFile`""
+        cmd.exe /c "cd $PythonArchPath && call $PythonExecName $logParams"
+        
+        # Display last part of log for debugging
+        if (Test-Path $logFile) {
+            Write-Host "Installation log (last 50 lines):"
+            Get-Content $logFile -Tail 50 | Write-Host
+        }
+        
+        # Check if Python was actually installed despite the error
+        $pythonExe = Join-Path $PythonArchPath "python.exe"
+        if (Test-Path $pythonExe) {
+            Write-Host "Python executable found despite installation error. Continuing..."
+            $LASTEXITCODE = 0  # Reset error code
         } else {
-            $exitCode = $process.ExitCode
-            if ($exitCode -ne 0) {
-                Write-Host "Installation failed with exit code: $exitCode"
-                Throw "Python installation failed"
-            }
+            Throw "Error happened during Python installation on ARM64"
         }
     } else {
-        Write-Host "Failed to start installation process"
-        Throw "Could not start Python installer"
-    }
-} else {
-    # Standard installation for x86, x64, and free-threaded builds
-    Write-Host "Using standard installation method..."
-    cmd.exe /c "cd `"$PythonArchPath`" && call `"$PythonExecName`" $ExecParams /quiet"
-    if ($LASTEXITCODE -ne 0) {
         Throw "Error happened during Python installation"
     }
 }
-
-Write-Host "Installation completed"
 
 # Free-threaded specific handling
 if ($IsFreeThreaded) {
@@ -196,10 +170,8 @@ $Env:PIP_ROOT_USER_ACTION = "ignore"
 $PythonExePath = Join-Path -Path $PythonArchPath -ChildPath "python.exe"
 cmd.exe /c "$PythonExePath -m ensurepip && $PythonExePath -m pip install --upgrade --force-reinstall pip --no-warn-script-location"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Warning: Pip installation/upgrade failed with exit code: $LASTEXITCODE"
+    Throw "Error happened during pip installation / upgrade"
 }
 
 Write-Host "Create complete file"
 New-Item -ItemType File -Path $PythonVersionPath -Name "$Architecture.complete" | Out-Null
-
-Write-Host "Setup completed successfully"
