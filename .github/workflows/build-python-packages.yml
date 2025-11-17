@@ -1,212 +1,257 @@
-[String] $Architecture = "{{__ARCHITECTURE__}}"
-[String] $HardwareArchitecture = "{{__HARDWARE_ARCHITECTURE__}}"
-[String] $Version = "{{__VERSION__}}"
-[String] $PythonExecName = "{{__PYTHON_EXEC_NAME__}}"
+name: Build Python package
+run-name: Generate Python ${{ inputs.VERSION || '3.13.7' }}
+on:
+  workflow_dispatch:
+    inputs:
+      VERSION:
+        description: 'Python version to build and upload'
+        default: '3.13.7'
+        required: true
+      PUBLISH_RELEASES:
+        description: 'Whether to publish releases'
+        required: true
+        type: boolean
+        default: false
+      THREADING_BUILD_MODES:
+        description: 'CPython threading build modes'
+        required: true
+        type: string
+        default: 'default,freethreaded'
+      PLATFORMS:
+        description: 'Platforms for execution in "os" or "os_arch" format (arch is "x64" by default)'
+        required: true
+        default: 'ubuntu-22.04,ubuntu-22.04_arm64,ubuntu-24.04,ubuntu-24.04_arm64,macos-15-intel_x64,macos-14_arm64,windows-2022_x64,windows-2022_x86,windows-11_arm64'
+  pull_request:
+    paths-ignore:
+    - 'versions-manifest.json'
+    - 'LICENSE'
+    - '**.md'
+    branches:
+    - 'main'
 
-function Get-RegistryVersionFilter {
-    param(
-        [Parameter(Mandatory)][String] $Architecture,
-        [Parameter(Mandatory)][Int32] $MajorVersion,
-        [Parameter(Mandatory)][Int32] $MinorVersion
-    )
+env:
+  VERSION: ${{ inputs.VERSION || '3.13.7' }}
+defaults:
+  run:
+    shell: pwsh
 
-    # FIX: Be more specific about architecture in registry filter
-    if ($Architecture -eq 'x86') {
-        $archFilter = "32-bit"
-    } elseif ($Architecture -eq 'arm64' -or $Architecture -eq 'arm64-freethreaded') {
-        $archFilter = "ARM64"
-    } else {
-        $archFilter = "64-bit"
-    }
-    
-    "Python $MajorVersion.$MinorVersion.*($archFilter)"
-}
+jobs:
+  generate_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - name: Generate execution matrix
+        id: generate-matrix
+        run: |
+          [String[]]$configurations = "${{ inputs.platforms || 'ubuntu-22.04,ubuntu-22.04_arm64,ubuntu-24.04,ubuntu-24.04_arm64,macos-15-intel,macos-14_arm64,windows-2022_x64,windows-2022_x86,windows-11_arm64' }}".Split(",").Trim()
+          [String[]]$buildModes = "${{ inputs.threading_build_modes || 'default' }}".Split(",").Trim()
+          $matrix = @()
+          
+          foreach ($configuration in $configurations) {
+            foreach ($buildMode in $buildModes) {
+              $parts = $configuration.Split("_")
+              $os = $parts[0]
+              $arch = if ($parts[1]) {$parts[1]} else {"x64"}
+              switch -wildcard ($os) {
+                "*ubuntu*" { $platform = $os.Replace("ubuntu","linux"); if ($arch -eq "arm64" ) { $os = "${os}-arm" } }
+                "*macos*" { $platform = 'darwin' }
+                "*windows*" { $platform = 'win32'; if ($arch -eq "arm64" ) { $os = "${os}-arm" } }
+              }
 
-function Remove-RegistryEntries {
-    param(
-        [Parameter(Mandatory)][String] $Architecture,
-        [Parameter(Mandatory)][Int32] $MajorVersion,
-        [Parameter(Mandatory)][Int32] $MinorVersion
-    )
+              if ($buildMode -eq "freethreaded") {
+                if ([semver]"${{ inputs.VERSION }}" -lt [semver]"3.13.0") {
+                  continue;
+                }
+                $arch += "-freethreaded"
+              }
 
-    # CRITICAL FIX: Use the actual architecture for registry cleanup, not hardware architecture
-    $versionFilter = Get-RegistryVersionFilter -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
-
-    $regPath = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products"
-    if (Test-Path -Path Registry::$regPath) {
-        $regKeys = Get-ChildItem -Path Registry::$regPath -Recurse | Where-Object Property -Ccontains DisplayName
-        foreach ($key in $regKeys) {
-            if ($key.getValue("DisplayName") -match $versionFilter) {
-                Remove-Item -Path $key.PSParentPath -Recurse -Force -Verbose
+              $matrix += @{
+                'platform' = $platform
+                'os' = $os
+                'arch' = $arch
+              }
             }
-        }
-    }
+          }
+          echo "matrix=$($matrix | ConvertTo-Json -Compress -AsArray)" >> $env:GITHUB_OUTPUT
+          
+  build_python:
+    needs: generate_matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate_matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      ARTIFACT_NAME: python-${{ inputs.VERSION || '3.13.7' }}-${{ matrix.platform }}-${{ matrix.arch }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+      
+      - name: Build Python ${{ env.VERSION }}
+        run: |
+          ./builders/build-python.ps1 -Version $env:VERSION `
+                  -Platform ${{ matrix.platform }} -Architecture ${{ matrix.arch }}
+                  
+      - name: Publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/artifact
+          if-no-files-found: error
 
-    $regPath = "HKEY_CLASSES_ROOT\Installer\Products"
-    if (Test-Path -Path Registry::$regPath) {
-        Get-ChildItem -Path Registry::$regPath | Where-Object { $_.GetValue("ProductName") -match $versionFilter } | ForEach-Object {
-            Remove-Item Registry::$_ -Recurse -Force -Verbose
-        }
-    }
+  test_python:
+    needs: [generate_matrix, build_python]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate_matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      ARTIFACT_NAME: python-${{ inputs.VERSION || '3.13.7' }}-${{ matrix.platform }}-${{ matrix.arch }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+        with:
+          submodules: true
 
-    $uninstallRegistrySections = @(
-        "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_CURRENT_USER\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-    )
+      - name: Fully cleanup the toolcache directory before testing
+        run: ./helpers/clean-toolcache.ps1 -ToolName "Python"
 
-    $uninstallRegistrySections | Where-Object { Test-Path -Path Registry::$_ } | ForEach-Object {
-        Get-ChildItem -Path Registry::$_ | Where-Object { $_.getValue("DisplayName") -match $versionFilter } | ForEach-Object {
-            Remove-Item Registry::$_ -Recurse -Force -Verbose
-        }
-    }
-    
-    # ADDITIONAL FIX: Clear Python-specific registry keys for the specific architecture
-    $pythonRegPaths = @(
-        "HKLM:\SOFTWARE\Python\PythonCore\$MajorVersion.$MinorVersion-arm64",
-        "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore\$MajorVersion.$MinorVersion-arm64",
-        "HKCU:\SOFTWARE\Python\PythonCore\$MajorVersion.$MinorVersion-arm64"
-    )
-    
-    if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
-        foreach ($regPath in $pythonRegPaths) {
-            if (Test-Path $regPath) {
-                Write-Host "Removing ARM64-specific registry path: $regPath"
-                Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Delete macOS /Library/Frameworks/Python.framework
+        if: matrix.platform == 'darwin'
+        shell: bash
+        run: if [ -d /Library/Frameworks/Python.framework ]; then sudo rm -rf /Library/Frameworks/Python.framework; fi
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+
+      - name: Extract files
+        run: |
+          if ('${{ matrix.platform }}' -eq 'win32') {
+            $artifactName = "${{ env.ARTIFACT_NAME }}.zip"
+            7z.exe x "$artifactName" -y | Out-Null
+          } else {
+            $artifactName = "${{ env.ARTIFACT_NAME }}.tar.gz"
+            tar -xzf $artifactName
+          }
+        working-directory: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+
+      - name: Apply build artifact to the local machine
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ('${{ matrix.platform }}' -eq 'win32') {
+            powershell ./setup.ps1
+            } else {
+              sh ./setup.sh
+              cp ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}/build_output.txt ${{ runner.temp }}
             }
-        }
-    }
-}
+        working-directory: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
 
-function Get-ExecParams {
-    param(
-        [Parameter(Mandatory)][Boolean] $IsMSI,
-        [Parameter(Mandatory)][Boolean] $IsFreeThreaded,
-        [Parameter(Mandatory)][String] $PythonArchPath
-    )
+      - name: Setup Python ${{ env.VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.VERSION }}
+          architecture: ${{ matrix.arch }}
 
-    if ($IsMSI) {
-        "TARGETDIR=$PythonArchPath ALLUSERS=1"
-    } else {
-        $Include_freethreaded = if ($IsFreeThreaded) { "Include_freethreaded=1" } else { "" }
-        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded"
-    }
-}
+      - name: Python version
+        run: python -VVV
 
-function Clear-InstallerCache {
-    Write-Host "Clearing Windows Installer cache..."
-    
-    # Clear any pending installer operations
-    Stop-Process -Name msiexec -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    
-    # Restart Windows Installer service to clear any cached state
-    Write-Host "Restarting Windows Installer service..."
-    Restart-Service -Name msiserver -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-}
+      - name: Verbose sysconfig dump
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: python ./sources/python-config-output.py
+        working-directory: ${{ github.workspace }}/tests
 
-$ToolcacheRoot = $env:AGENT_TOOLSDIRECTORY
-if ([string]::IsNullOrEmpty($ToolcacheRoot)) {
-    # GitHub images don't have `AGENT_TOOLSDIRECTORY` variable
-    $ToolcacheRoot = $env:RUNNER_TOOL_CACHE
-}
-$PythonToolcachePath = Join-Path -Path $ToolcacheRoot -ChildPath "Python"
-$PythonVersionPath = Join-Path -Path $PythonToolcachePath -ChildPath $Version
-$PythonArchPath = Join-Path -Path $PythonVersionPath -ChildPath $Architecture
+      - name: Verbose python binary links
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          $pythonLocation = which python
+          if ('${{ matrix.platform }}' -eq 'darwin') { otool -L $pythonLocation } else { ldd $pythonLocation }
 
-$IsMSI = $PythonExecName -match "msi"
-$IsFreeThreaded = $Architecture -match "-freethreaded"
-
-$MajorVersion = $Version.Split('.')[0]
-$MinorVersion = $Version.Split('.')[1]
-
-Write-Host "Check if Python hostedtoolcache folder exist..."
-if (-Not (Test-Path $PythonToolcachePath)) {
-    Write-Host "Create Python toolcache folder"
-    New-Item -ItemType Directory -Path $PythonToolcachePath | Out-Null
-}
-
-Write-Host "Check if current Python version is installed..."
-$InstalledVersions = Get-Item "$PythonToolcachePath\$MajorVersion.$MinorVersion.*\$Architecture" -ErrorAction SilentlyContinue
-
-if ($null -ne $InstalledVersions) {
-    Write-Host "Python$MajorVersion.$MinorVersion ($Architecture) was found in $PythonToolcachePath..."
-
-    foreach ($InstalledVersion in $InstalledVersions) {
-        if (Test-Path -Path $InstalledVersion) {
-            Write-Host "Deleting $InstalledVersion..."
-            Remove-Item -Path $InstalledVersion -Recurse -Force
-            if (Test-Path -Path "$($InstalledVersion.Parent.FullName)/${Architecture}.complete") {
-                Remove-Item -Path "$($InstalledVersion.Parent.FullName)/${Architecture}.complete" -Force -Verbose
+      - name: Run tests
+        run: |
+            Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+            Import-Module Pester
+            $pesterContainer = New-PesterContainer -Path './python-tests.ps1' -Data @{
+                Version="${{ env.VERSION }}";
+                Platform="${{ matrix.platform }}";
+                Architecture="${{ matrix.arch }}";
             }
-        }
-    }
-} else {
-    Write-Host "No Python$MajorVersion.$MinorVersion.* found"
-}
+            $Result = Invoke-Pester -Container $pesterContainer -PassThru
+            if ($Result.FailedCount -gt 0) {
+              $host.SetShouldExit($Result.FailedCount)
+              exit $Result.FailedCount
+            }
+        working-directory: ${{ github.workspace }}/tests
 
-Write-Host "Remove registry entries for Python ${MajorVersion}.${MinorVersion}(${Architecture})..."
-Remove-RegistryEntries -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
+  publish_release:
+      name: Publish release
+      if: github.event_name == 'workflow_dispatch' && inputs.PUBLISH_RELEASES
+      needs: test_python
+      runs-on: ubuntu-latest
+      steps:
+      - uses: actions/download-artifact@v4
 
-# CRITICAL FIX: Clear installer cache when installing ARM64 after x64
-if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
-    Clear-InstallerCache
-}
+      - name: Publish Release ${{ env.VERSION }}
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.VERSION }}-${{ github.run_id }}
+          release_name: ${{ env.VERSION }}
+          body: |
+            Python ${{ env.VERSION }}
 
-Write-Host "Create Python $Version folder in $PythonToolcachePath"
-New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
+      - name: Generate hash for packages
+        run: |
+          $childItems = Get-Childitem -Path '.'
+          $childItems | Foreach-Object {
+            $packageObj = Get-Childitem -Path $_.FullName | Select-Object -First 1
+            Write-Host "Package: $($packageObj.Name)"
+            $actualHash = (Get-FileHash -Path $packageObj.FullName -Algorithm sha256).Hash
+            $hashString = "$actualHash $($packageObj.Name)"
+            Write-Host "$hashString"
+            Add-Content -Path ./hashes.sha256 -Value "$hashString"
+          } 
+  
+      - name: Upload release assets
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            for (let artifactDir of fs.readdirSync('.')) {
+              let artifactName = fs.lstatSync(artifactDir).isDirectory() ? fs.readdirSync(`${artifactDir}`)[0] : artifactDir;
+  
+              console.log(`Upload ${artifactName} asset`);
+              github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: ${{ steps.create_release.outputs.id }},
+                name: artifactName,
+                data: fs.lstatSync(artifactDir).isDirectory() ? fs.readFileSync(`./${artifactDir}/${artifactName}`) : fs.readFileSync(`./${artifactName}`).toString()
+              });
+            }
 
-Write-Host "Copy Python binaries to $PythonArchPath"
-Copy-Item -Path ./$PythonExecName -Destination $PythonArchPath | Out-Null
-
-Write-Host "Install Python $Version in $PythonToolcachePath..."
-$ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
-
-# FIX: For ARM64, ensure clean environment
-if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
-    Write-Host "Installing Python for ARM64 architecture..."
-    
-    # Clear any x64 Python from PATH temporarily
-    $originalPath = $env:PATH
-    $env:PATH = $env:PATH -replace '[^;]*Python[^;]*x64[^;]*;?', ''
-    
-    # Install Python
-    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
-    $installExitCode = $LASTEXITCODE
-    
-    # Restore original PATH
-    $env:PATH = $originalPath
-    
-    if ($installExitCode -ne 0) {
-        Write-Host "Installation failed with exit code: $installExitCode"
-        Throw "Error happened during Python installation"
-    }
-} else {
-    # Standard installation for non-ARM64
-    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
-    if ($LASTEXITCODE -ne 0) {
-        Throw "Error happened during Python installation"
-    }
-}
-
-if ($IsFreeThreaded) {
-    # Delete python.exe and create a symlink to free-threaded exe
-    Remove-Item -Path "$PythonArchPath\python.exe" -Force
-    New-Item -Path "$PythonArchPath\python.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python${MajorVersion}.${MinorVersion}t.exe"
-}
-
-Write-Host "Create 'python3' symlink"
-New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
-
-Write-Host "Install and upgrade Pip"
-$Env:PIP_ROOT_USER_ACTION = "ignore"
-$PythonExePath = Join-Path -Path $PythonArchPath -ChildPath "python.exe"
-cmd.exe /c "$PythonExePath -m ensurepip && $PythonExePath -m pip install --upgrade --force-reinstall pip --no-warn-script-location"
-if ($LASTEXITCODE -ne 0) {
-    Throw "Error happened during pip installation / upgrade"
-}
-
-Write-Host "Create complete file"
-New-Item -ItemType File -Path $PythonVersionPath -Name "$Architecture.complete" | Out-Null
+  trigger_pr:
+    name: Trigger "Create Pull Request" workflow
+    needs: publish_release
+    runs-on: ubuntu-latest
+    steps:
+    - name: Trigger "Create Pull Request" workflow
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'create-pr.yml',
+            ref: 'main'
+          });
