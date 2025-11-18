@@ -10,12 +10,7 @@ function Get-RegistryVersionFilter {
         [Parameter(Mandatory)][Int32] $MinorVersion
     )
 
-    # This filter is now more specific to prevent architecture conflicts during cleanup.
-    $archFilter = switch -regex ($Architecture) {
-        'x86' { "32-bit" }
-        'arm64' { "ARM64" }
-        default { "64-bit" }
-    }
+    $archFilter = if ($Architecture -eq 'x86') { "32-bit" } else { "64-bit" }
     "Python $MajorVersion.$MinorVersion.*($archFilter)"
 }
 
@@ -26,8 +21,7 @@ function Remove-RegistryEntries {
         [Parameter(Mandatory)][Int32] $MinorVersion
     )
 
-    # Using the correct $Architecture variable ensures we only clean up what we intend to.
-    $versionFilter = Get-RegistryVersionFilter -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
+    $versionFilter = Get-RegistryVersionFilter -Architecture $HardwareArchitecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
 
     $regPath = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products"
     if (Test-Path -Path Registry::$regPath) {
@@ -47,10 +41,10 @@ function Remove-RegistryEntries {
     }
 
     $uninstallRegistrySections = @(
-        "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_CURRENT_USER\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",  # current user, x64
+        "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall", # all users, x64
+        "HKEY_CURRENT_USER\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",  # current user, x86
+        "HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"  # all users, x86
     )
 
     $uninstallRegistrySections | Where-Object { Test-Path -Path Registry::$_ } | ForEach-Object {
@@ -97,7 +91,8 @@ if (-Not (Test-Path $PythonToolcachePath)) {
 }
 
 Write-Host "Check if current Python version is installed..."
-# This ErrorAction is critical for ensuring the script doesn't fail on a clean install.
+# CRITICAL FIX: Restore -ErrorAction SilentlyContinue. This prevents the script from
+# failing when no previous installation is found, which is the standard case.
 $InstalledVersions = Get-Item "$PythonToolcachePath\$MajorVersion.$MinorVersion.*\$Architecture" -ErrorAction SilentlyContinue
 
 if ($null -ne $InstalledVersions) {
@@ -118,15 +113,6 @@ if ($null -ne $InstalledVersions) {
 
 Write-Host "Remove registry entries for Python ${MajorVersion}.${MinorVersion}(${Architecture})..."
 Remove-RegistryEntries -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
-
-# This block is the specific fix for the ARM64 conflict after an x64 installation.
-if ($Architecture -eq "arm64" -or $Architecture -eq "arm64-freethreaded") {
-    Write-Host "Preparing clean environment for ARM64 installation by restarting Windows Installer service..."
-    Stop-Process -Name msiexec -Force -ErrorAction SilentlyContinue
-    Restart-Service -Name msiserver -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3 # Give the service a moment to settle.
-    Write-Host "Windows Installer service has been reset."
-}
 
 Write-Host "Create Python $Version folder in $PythonToolcachePath"
 New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
