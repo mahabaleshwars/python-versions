@@ -1,4 +1,5 @@
-{
+[
+  {
   "version": "3.13.6",
   "stable": true,
   "release_url": "https://github.com/mahabaleshwars/python-versions/releases/tag/3.13.6-19454060048",
@@ -121,3 +122,4 @@
     }
   ]
 }
+]
