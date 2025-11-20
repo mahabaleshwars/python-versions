@@ -3,63 +3,57 @@
 [String] $Version = "{{__VERSION__}}"
 [String] $PythonExecName = "{{__PYTHON_EXEC_NAME__}}"
 
+# This function is no longer reliable for cleanup and is being deprecated.
+# We keep it here in case it's used by other parts of the build we can't see.
 function Get-RegistryVersionFilter {
     param(
         [Parameter(Mandatory)][String] $Architecture,
         [Parameter(Mandatory)][Int32] $MajorVersion,
         [Parameter(Mandatory)][Int32] $MinorVersion
     )
-
-    # This filter is now specific to the installation architecture. This is critical
-    # to prevent an ARM64 cleanup from affecting an existing x64 installation.
     $archFilter = switch ($Architecture) {
         'x86' { "32-bit" }
         'arm64' { "ARM64" }
         'arm64-freethreaded' { "ARM64" }
-        default { "64-bit" } # Catches x64
+        default { "64-bit" }
     }
-    
     "Python $MajorVersion.$MinorVersion.*($archFilter)"
 }
 
-function Remove-RegistryEntries {
+# This is the new, robust cleanup function.
+function Remove-InstallationByPath {
     param(
-        [Parameter(Mandatory)][String] $Architecture,
-        [Parameter(Mandatory)][Int32] $MajorVersion,
-        [Parameter(Mandatory)][Int32] $MinorVersion
+        [Parameter(Mandatory)][String] $InstallPath
     )
+    
+    # 1. Find the Uninstall string from the registry based on the specific install path.
+    $uninstallKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    $uninstallKey = Get-ChildItem -Path $uninstallKeyPath -Recurse | ForEach-Object {
+        $key = $_
+        if (($key.GetValue("InstallLocation") -eq $InstallPath)) {
+            return $key
+        }
+    }
 
-    # Using the correct $Architecture variable ensures we only clean up what we intend to.
-    $versionFilter = Get-RegistryVersionFilter -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
-
-    $regPath = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products"
-    if (Test-Path -Path Registry::$regPath) {
-        $regKeys = Get-ChildItem -Path Registry::$regPath -Recurse | Where-Object Property -Ccontains DisplayName
-        foreach ($key in $regKeys) {
-            if ($key.getValue("DisplayName") -match $versionFilter) {
-                Remove-Item -Path $key.PSParentPath -Recurse -Force -Verbose
+    if ($null -ne $uninstallKey) {
+        $uninstallString = $uninstallKey.GetValue("UninstallString")
+        if (-not [string]::IsNullOrEmpty($uninstallString)) {
+            Write-Host "Found existing installation at specified path. Running uninstaller: $uninstallString"
+            # 2. Run the official uninstaller silently and wait for it to complete.
+            $command, $args = $uninstallString.Split(' ', 2)
+            $process = Start-Process -FilePath $command -ArgumentList "$args /quiet" -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+                Write-Host "Uninstaller finished with a non-zero exit code: $($process.ExitCode). Continuing cleanup."
+            } else {
+                Write-Host "Uninstaller completed successfully."
             }
         }
     }
 
-    $regPath = "HKEY_CLASSES_ROOT\Installer\Products"
-    if (Test-Path -Path Registry::$regPath) {
-        Get-ChildItem -Path Registry::$regPath | Where-Object { $_.GetValue("ProductName") -match $versionFilter } | ForEach-Object {
-            Remove-Item Registry::$_ -Recurse -Force -Verbose
-        }
-    }
-
-    $uninstallRegistrySections = @(
-        "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_CURRENT_USER\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-    )
-
-    $uninstallRegistrySections | Where-Object { Test-Path -Path Registry::$_ } | ForEach-Object {
-        Get-ChildItem -Path Registry::$_ | Where-Object { $_.getValue("DisplayName") -match $versionFilter } | ForEach-Object {
-            Remove-Item Registry::$_ -Recurse -Force -Verbose
-        }
+    # 3. As a final guarantee, forcefully remove the directory.
+    if (Test-Path $InstallPath) {
+        Write-Host "Forcefully removing installation directory to ensure a clean state: $InstallPath"
+        Remove-Item -Path $InstallPath -Recurse -Force
     }
 }
 
@@ -84,7 +78,8 @@ if ([string]::IsNullOrEmpty($ToolcacheRoot)) {
     $ToolcacheRoot = $env:RUNNER_TOOL_CACHE
 }
 $PythonToolcachePath = Join-Path -Path $ToolcacheRoot -ChildPath "Python"
-$PythonVersionPath = Join-Path -Path $ToolcachePath -ChildPath $Version
+$PythonVersionPath = Join-Path -Path $PythonToolcachePath -ChildPath $Version
+# This is the unique, definitive path for this specific architecture.
 $PythonArchPath = Join-Path -Path $PythonVersionPath -ChildPath $Architecture
 
 $IsMSI = $PythonExecName -match "msi"
@@ -99,28 +94,16 @@ if (-Not (Test-Path $PythonToolcachePath)) {
     New-Item -ItemType Directory -Path $PythonToolcachePath | Out-Null
 }
 
-Write-Host "Check if current Python version is installed..."
-# This ErrorAction is critical for ensuring the script doesn't fail on a clean install.
-$InstalledVersions = Get-Item "$PythonToolcachePath\$MajorVersion.$MinorVersion.*\$Architecture" -ErrorAction SilentlyContinue
+# THE CORE FIX: Instead of searching for and deleting arbitrary registry keys, we now
+# perform a targeted uninstall and cleanup based on the *exact* path for the architecture we are about to install.
+Write-Host "Ensuring clean installation directory for $PythonArchPath..."
+Remove-InstallationByPath -InstallPath $PythonArchPath
 
-if ($null -ne $InstalledVersions) {
-    Write-Host "Python$MajorVersion.$MinorVersion ($Architecture) was found in $PythonToolcachePath..."
-
-    foreach ($InstalledVersion in $InstalledVersions) {
-        if (Test-Path -Path $InstalledVersion) {
-            Write-Host "Deleting $InstalledVersion..."
-            Remove-Item -Path $InstalledVersion -Recurse -Force
-            if (Test-Path -Path "$($InstalledVersion.Parent.FullName)/${Architecture}.complete") {
-                Remove-Item -Path "$($InstalledVersion.Parent.FullName)/${Architecture}.complete" -Force -Verbose
-            }
-        }
-    }
-} else {
-    Write-Host "No Python$MajorVersion.$MinorVersion.* found"
+# This check for a .complete file is still useful.
+$completionFile = Join-Path $PythonVersionPath "$Architecture.complete"
+if (Test-Path $completionFile) {
+    Remove-Item $completionFile -Force
 }
-
-Write-Host "Remove registry entries for Python ${MajorVersion}.${MinorVersion}(${Architecture})..."
-Remove-RegistryEntries -Architecture $Architecture -MajorVersion $MajorVersion -MinorVersion $MinorVersion
 
 Write-Host "Create Python $Version folder in $PythonToolcachePath"
 New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
@@ -133,7 +116,7 @@ $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -Pyth
 
 cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
 if ($LASTEXITCODE -ne 0) {
-    Throw "Error happened during Python installation"
+    Throw "Error happened during Python installation. Exit code: $LASTEXITCODE"
 }
 
 if ($IsFreeThreaded) {
