@@ -3,58 +3,14 @@
 [String] $Version = "{{__VERSION__}}"
 [String] $PythonExecName = "{{__PYTHON_EXEC_NAME__}}"
 
-# This function is no longer reliable for cleanup and is being deprecated.
-# We keep it here in case it's used by other parts of the build we can't see.
-function Get-RegistryVersionFilter {
-    param(
-        [Parameter(Mandatory)][String] $Architecture,
-        [Parameter(Mandatory)][Int32] $MajorVersion,
-        [Parameter(Mandatory)][Int32] $MinorVersion
-    )
-    $archFilter = switch ($Architecture) {
-        'x86' { "32-bit" }
-        'arm64' { "ARM64" }
-        'arm64-freethreaded' { "ARM64" }
-        default { "64-bit" }
-    }
-    "Python $MajorVersion.$MinorVersion.*($archFilter)"
-}
-
-# This is the new, robust cleanup function.
-function Remove-InstallationByPath {
+# This function is now only used for finding registry keys to delete.
+function Get-RegistryKeyByInstallPath {
     param(
         [Parameter(Mandatory)][String] $InstallPath
     )
-    
-    # 1. Find the Uninstall string from the registry based on the specific install path.
     $uninstallKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-    $uninstallKey = Get-ChildItem -Path $uninstallKeyPath -Recurse | ForEach-Object {
-        $key = $_
-        if (($key.GetValue("InstallLocation") -eq $InstallPath)) {
-            return $key
-        }
-    }
-
-    if ($null -ne $uninstallKey) {
-        $uninstallString = $uninstallKey.GetValue("UninstallString")
-        if (-not [string]::IsNullOrEmpty($uninstallString)) {
-            Write-Host "Found existing installation at specified path. Running uninstaller: $uninstallString"
-            # 2. Run the official uninstaller silently and wait for it to complete.
-            $command, $args = $uninstallString.Split(' ', 2)
-            $process = Start-Process -FilePath $command -ArgumentList "$args /quiet" -Wait -PassThru
-            if ($process.ExitCode -ne 0) {
-                Write-Host "Uninstaller finished with a non-zero exit code: $($process.ExitCode). Continuing cleanup."
-            } else {
-                Write-Host "Uninstaller completed successfully."
-            }
-        }
-    }
-
-    # 3. As a final guarantee, forcefully remove the directory.
-    if (Test-Path $InstallPath) {
-        Write-Host "Forcefully removing installation directory to ensure a clean state: $InstallPath"
-        Remove-Item -Path $InstallPath -Recurse -Force
-    }
+    # Find all uninstall keys that point to the specific installation directory.
+    return Get-ChildItem -Path $uninstallKeyPath -Recurse | Where-Object { $_.GetValue("InstallLocation") -eq $InstallPath }
 }
 
 function Get-ExecParams {
@@ -79,7 +35,7 @@ if ([string]::IsNullOrEmpty($ToolcacheRoot)) {
 }
 $PythonToolcachePath = Join-Path -Path $ToolcacheRoot -ChildPath "Python"
 $PythonVersionPath = Join-Path -Path $PythonToolcachePath -ChildPath $Version
-# This is the unique, definitive path for this specific architecture.
+# This is the unique, definitive path for the architecture being installed.
 $PythonArchPath = Join-Path -Path $PythonVersionPath -ChildPath $Architecture
 
 $IsMSI = $PythonExecName -match "msi"
@@ -88,22 +44,40 @@ $IsFreeThreaded = $Architecture -match "-freethreaded"
 $MajorVersion = $Version.Split('.')[0]
 $MinorVersion = $Version.Split('.')[1]
 
-Write-Host "Check if Python hostedtoolcache folder exist..."
-if (-Not (Test-Path $PythonToolcachePath)) {
-    Write-Host "Create Python toolcache folder"
-    New-Item -ItemType Directory -Path $PythonToolcachePath | Out-Null
-}
+# --- NEW, SIMPLIFIED CLEANUP LOGIC ---
 
-# THE CORE FIX: Instead of searching for and deleting arbitrary registry keys, we now
-# perform a targeted uninstall and cleanup based on the *exact* path for the architecture we are about to install.
-Write-Host "Ensuring clean installation directory for $PythonArchPath..."
-Remove-InstallationByPath -InstallPath $PythonArchPath
+Write-Host "Checking for existing installation at target path: $PythonArchPath"
+# This is the core of the new logic. We only act if the specific directory for this architecture already exists.
+if (Test-Path $PythonArchPath) {
+    Write-Host "Existing installation found. Performing targeted cleanup..."
 
-# This check for a .complete file is still useful.
-$completionFile = Join-Path $PythonVersionPath "$Architecture.complete"
-if (Test-Path $completionFile) {
-    Remove-Item $completionFile -Force
+    # 1. Find the specific registry keys associated with this *exact* installation path.
+    $registryKeys = Get-RegistryKeyByInstallPath -InstallPath $PythonArchPath
+    if ($null -ne $registryKeys) {
+        foreach ($key in $registryKeys) {
+            Write-Host "Removing registry key: $($key.PSPath)"
+            Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        Write-Host "No associated registry keys found for this path."
+    }
+
+    # 2. Forcefully remove the directory. This is the most reliable way to ensure a clean slate.
+    Write-Host "Forcefully removing installation directory: $PythonArchPath"
+    Remove-Item -Path $PythonArchPath -Recurse -Force
+
+    # 3. Also remove the completion marker file if it exists.
+    $completionFile = Join-Path $PythonVersionPath "$Architecture.complete"
+    if (Test-Path $completionFile) {
+        Write-Host "Removing completion marker file."
+        Remove-Item $completionFile -Force
+    }
+    
+    Write-Host "Targeted cleanup complete."
+} else {
+    Write-Host "No previous installation found at target path. No cleanup needed."
 }
+# --- END OF NEW CLEANUP LOGIC ---
 
 Write-Host "Create Python $Version folder in $PythonToolcachePath"
 New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
@@ -116,6 +90,16 @@ $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -Pyth
 
 cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
 if ($LASTEXITCODE -ne 0) {
+    # If the installation fails, provide detailed logs for diagnosis.
+    $logFile = Join-Path $env:TEMP "python_install_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $logParams = "$ExecParams /log `"$logFile`""
+    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $logParams"
+    
+    if (Test-Path $logFile) {
+        Write-Host "Installation failed. Displaying log (last 100 lines):"
+        Get-Content $logFile -Tail 100 | Write-Host
+    }
+    
     Throw "Error happened during Python installation. Exit code: $LASTEXITCODE"
 }
 
