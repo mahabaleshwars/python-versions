@@ -3,13 +3,11 @@
 [String] $Version = "{{__VERSION__}}"
 [String] $PythonExecName = "{{__PYTHON_EXEC_NAME__}}"
 
-# This function is now only used for finding registry keys to delete.
 function Get-RegistryKeyByInstallPath {
     param(
         [Parameter(Mandatory)][String] $InstallPath
     )
     $uninstallKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-    # Find all uninstall keys that point to the specific installation directory.
     return Get-ChildItem -Path $uninstallKeyPath -Recurse | Where-Object { $_.GetValue("InstallLocation") -eq $InstallPath }
 }
 
@@ -21,21 +19,19 @@ function Get-ExecParams {
     )
 
     if ($IsMSI) {
-        "TARGETDIR=$PythonArchPath ALLUSERS=1"
+        "TARGETDIR=$PythonArchPath ALLUSERS=1 /quiet"
     } else {
         $Include_freethreaded = if ($IsFreeThreaded) { "Include_freethreaded=1" } else { "" }
-        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded"
+        "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded /quiet"
     }
 }
 
 $ToolcacheRoot = $env:AGENT_TOOLSDIRECTORY
 if ([string]::IsNullOrEmpty($ToolcacheRoot)) {
-    # GitHub images don't have `AGENT_TOOLSDIRECTORY` variable
     $ToolcacheRoot = $env:RUNNER_TOOL_CACHE
 }
 $PythonToolcachePath = Join-Path -Path $ToolcacheRoot -ChildPath "Python"
 $PythonVersionPath = Join-Path -Path $PythonToolcachePath -ChildPath $Version
-# This is the unique, definitive path for the architecture being installed.
 $PythonArchPath = Join-Path -Path $PythonVersionPath -ChildPath $Architecture
 
 $IsMSI = $PythonExecName -match "msi"
@@ -44,71 +40,60 @@ $IsFreeThreaded = $Architecture -match "-freethreaded"
 $MajorVersion = $Version.Split('.')[0]
 $MinorVersion = $Version.Split('.')[1]
 
-# --- NEW, SIMPLIFIED CLEANUP LOGIC ---
-
+# --- SIMPLIFIED CLEANUP LOGIC ---
 Write-Host "Checking for existing installation at target path: $PythonArchPath"
-# This is the core of the new logic. We only act if the specific directory for this architecture already exists.
 if (Test-Path $PythonArchPath) {
     Write-Host "Existing installation found. Performing targeted cleanup..."
-
-    # 1. Find the specific registry keys associated with this *exact* installation path.
     $registryKeys = Get-RegistryKeyByInstallPath -InstallPath $PythonArchPath
     if ($null -ne $registryKeys) {
         foreach ($key in $registryKeys) {
             Write-Host "Removing registry key: $($key.PSPath)"
             Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
         }
-    } else {
-        Write-Host "No associated registry keys found for this path."
     }
-
-    # 2. Forcefully remove the directory. This is the most reliable way to ensure a clean slate.
     Write-Host "Forcefully removing installation directory: $PythonArchPath"
     Remove-Item -Path $PythonArchPath -Recurse -Force
-
-    # 3. Also remove the completion marker file if it exists.
     $completionFile = Join-Path $PythonVersionPath "$Architecture.complete"
-    if (Test-Path $completionFile) {
-        Write-Host "Removing completion marker file."
-        Remove-Item $completionFile -Force
-    }
-    
-    Write-Host "Targeted cleanup complete."
+    if (Test-Path $completionFile) { Remove-Item $completionFile -Force }
 } else {
-    Write-Host "No previous installation found at target path. No cleanup needed."
+    Write-Host "No previous installation found at target path."
 }
-# --- END OF NEW CLEANUP LOGIC ---
 
-Write-Host "Create Python $Version folder in $PythonToolcachePath"
+# --- ROBUST INSTALLATION EXECUTION ---
+
+# 1. Force a reset of the Windows Installer service before EVERY installation.
+# This prevents hangs caused by a stuck or corrupted installer service on the runner.
+Write-Host "Resetting Windows Installer service to ensure a clean state..."
+Stop-Process -Name msiexec -Force -ErrorAction SilentlyContinue
+Restart-Service -Name msiserver -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 3 # Give the service a moment to settle.
+Write-Host "Windows Installer service has been reset."
+
+Write-Host "Creating Python installation folder at: $PythonArchPath"
 New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
 
-Write-Host "Copy Python binaries to $PythonArchPath"
-Copy-Item -Path ./$PythonExecName -Destination $PythonArchPath | Out-Null
+$InstallerPath = Join-Path -Path $PythonArchPath -ChildPath $PythonExecName
+Write-Host "Copying Python installer to: $InstallerPath"
+Copy-Item -Path ./$PythonExecName -Destination $InstallerPath | Out-Null
 
-Write-Host "Install Python $Version in $PythonToolcachePath..."
+Write-Host "Starting Python installation..."
 $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
 
-cmd.exe /c "cd $PythonArchPath && call $PythonExecName $ExecParams /quiet"
-if ($LASTEXITCODE -ne 0) {
-    # If the installation fails, provide detailed logs for diagnosis.
-    $logFile = Join-Path $env:TEMP "python_install_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    $logParams = "$ExecParams /log `"$logFile`""
-    cmd.exe /c "cd $PythonArchPath && call $PythonExecName $logParams"
-    
-    if (Test-Path $logFile) {
-        Write-Host "Installation failed. Displaying log (last 100 lines):"
-        Get-Content $logFile -Tail 100 | Write-Host
-    }
-    
-    Throw "Error happened during Python installation. Exit code: $LASTEXITCODE"
+# 2. Use PowerShell's Start-Process for a more reliable, wait-enabled execution.
+# This avoids potential issues with `cmd.exe /c call`.
+$process = Start-Process -FilePath $InstallerPath -ArgumentList $ExecParams -Wait -PassThru -ErrorAction Stop
+
+if ($process.ExitCode -ne 0) {
+    Throw "Python installer failed with exit code: $($process.ExitCode)"
 }
 
+Write-Host "Python installation completed successfully."
+
+# --- POST-INSTALLATION STEPS ---
 if ($IsFreeThreaded) {
-    # Delete python.exe and create a symlink to free-threaded exe
     Remove-Item -Path "$PythonArchPath\python.exe" -Force
     New-Item -Path "$PythonArchPath\python.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python${MajorVersion}.${MinorVersion}t.exe"
 }
-
 Write-Host "Create `python3` symlink"
 New-Item -Path "$PythonArchPath\python3.exe" -ItemType SymbolicLink -Value "$PythonArchPath\python.exe"
 
