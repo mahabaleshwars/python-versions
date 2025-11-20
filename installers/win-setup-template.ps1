@@ -3,14 +3,6 @@
 [String] $Version = "{{__VERSION__}}"
 [String] $PythonExecName = "{{__PYTHON_EXEC_NAME__}}"
 
-function Get-RegistryKeyByInstallPath {
-    param(
-        [Parameter(Mandatory)][String] $InstallPath
-    )
-    $uninstallKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-    return Get-ChildItem -Path $uninstallKeyPath -Recurse | Where-Object { $_.GetValue("InstallLocation") -eq $InstallPath }
-}
-
 function Get-ExecParams {
     param(
         [Parameter(Mandatory)][Boolean] $IsMSI,
@@ -23,6 +15,31 @@ function Get-ExecParams {
     } else {
         $Include_freethreaded = if ($IsFreeThreaded) { "Include_freethreaded=1" } else { "" }
         "DefaultAllUsersTargetDir=$PythonArchPath InstallAllUsers=1 $Include_freethreaded /quiet"
+    }
+}
+
+function Preemptive-RemoveAllPythonRegistryKeys {
+    param(
+        [Parameter(Mandatory)][String] $MajorVersion,
+        [Parameter(Mandatory)][String] $MinorVersion
+    )
+    Write-Host "Aggressively removing any pre-existing Python $MajorVersion.$MinorVersion registry keys..."
+    $versionString = "Python $MajorVersion.$MinorVersion"
+
+    # Search and destroy any matching keys in the main Uninstall sections
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($path in $uninstallPaths) {
+        if (Test-Path $path) {
+            Get-ChildItem -Path $path -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                if ($_.GetValue("DisplayName") -match [regex]::Escape($versionString)) {
+                    Write-Host "Removing pre-existing registry key: $($_.PSPath)"
+                    Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
     }
 }
 
@@ -40,34 +57,16 @@ $IsFreeThreaded = $Architecture -match "-freethreaded"
 $MajorVersion = $Version.Split('.')[0]
 $MinorVersion = $Version.Split('.')[1]
 
-# --- SIMPLIFIED CLEANUP LOGIC ---
-Write-Host "Checking for existing installation at target path: $PythonArchPath"
-if (Test-Path $PythonArchPath) {
-    Write-Host "Existing installation found. Performing targeted cleanup..."
-    $registryKeys = Get-RegistryKeyByInstallPath -InstallPath $PythonArchPath
-    if ($null -ne $registryKeys) {
-        foreach ($key in $registryKeys) {
-            Write-Host "Removing registry key: $($key.PSPath)"
-            Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-    Write-Host "Forcefully removing installation directory: $PythonArchPath"
-    Remove-Item -Path $PythonArchPath -Recurse -Force
-    $completionFile = Join-Path $PythonVersionPath "$Architecture.complete"
-    if (Test-Path $completionFile) { Remove-Item $completionFile -Force }
-} else {
-    Write-Host "No previous installation found at target path."
-}
+# --- AGGRESSIVE CLEANUP AND ROBUST INSTALLATION ---
 
-# --- ROBUST INSTALLATION EXECUTION ---
+# 1. Aggressively remove ANY potential conflicting registry keys from the runner.
+Preemptive-RemoveAllPythonRegistryKeys -MajorVersion $MajorVersion -MinorVersion $MinorVersion
 
-# 1. Force a reset of the Windows Installer service before EVERY installation.
-# This prevents hangs caused by a stuck or corrupted installer service on the runner.
-Write-Host "Resetting Windows Installer service to ensure a clean state..."
+# 2. Force a reset of the Windows Installer service to clear any stuck processes.
+Write-Host "Resetting Windows Installer service..."
 Stop-Process -Name msiexec -Force -ErrorAction SilentlyContinue
 Restart-Service -Name msiserver -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 3 # Give the service a moment to settle.
-Write-Host "Windows Installer service has been reset."
+Start-Sleep -Seconds 3
 
 Write-Host "Creating Python installation folder at: $PythonArchPath"
 New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
@@ -79,12 +78,25 @@ Copy-Item -Path ./$PythonExecName -Destination $InstallerPath | Out-Null
 Write-Host "Starting Python installation..."
 $ExecParams = Get-ExecParams -IsMSI $IsMSI -IsFreeThreaded $IsFreeThreaded -PythonArchPath $PythonArchPath
 
-# 2. Use PowerShell's Start-Process for a more reliable, wait-enabled execution.
-# This avoids potential issues with `cmd.exe /c call`.
-$process = Start-Process -FilePath $InstallerPath -ArgumentList $ExecParams -Wait -PassThru -ErrorAction Stop
-
-if ($process.ExitCode -ne 0) {
-    Throw "Python installer failed with exit code: $($process.ExitCode)"
+# Use Start-Process for a more reliable execution, now with logging on failure.
+try {
+    $process = Start-Process -FilePath $InstallerPath -ArgumentList $ExecParams -Wait -PassThru -ErrorAction Stop
+    if ($process.ExitCode -ne 0) {
+        Throw "Python installer failed with exit code: $($process.ExitCode)"
+    }
+} catch {
+    Write-Host "Initial installation failed. Retrying with verbose logging..."
+    $logFile = Join-Path $env:TEMP "python_install_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $logParams = "$ExecParams /log `"$logFile`""
+    
+    Start-Process -FilePath $InstallerPath -ArgumentList $logParams -Wait -PassThru
+    
+    if (Test-Path $logFile) {
+        Write-Host "Installation failed. Displaying verbose log:"
+        Get-Content $logFile | Write-Host
+    }
+    # Re-throw the original exception to fail the job.
+    throw $_
 }
 
 Write-Host "Python installation completed successfully."
