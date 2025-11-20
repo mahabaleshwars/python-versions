@@ -64,11 +64,11 @@ function Remove-RegistryEntries {
                             Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
                         }
                     } catch {
-                        Write-Warning "Failed to process registry key: $($key.PSPath). Error: $_"
+                        Write-Warning "Failed to process registry key: $($key.PSPath). Error: $($_.Exception.Message)"
                     }
                 }
             } catch {
-                Write-Warning "Failed to enumerate UserData registry entries: $_"
+                Write-Warning "Failed to enumerate UserData registry entries: $($_.Exception.Message)"
             }
         }
 
@@ -88,7 +88,7 @@ function Remove-RegistryEntries {
                     }
                 }
             } catch {
-                Write-Warning "Failed to enumerate Installer Products registry entries: $_"
+                Write-Warning "Failed to enumerate Installer Products registry entries: $($_.Exception.Message)"
             }
         }
 
@@ -115,8 +115,9 @@ function Remove-RegistryEntries {
         }
 
         $uninstallRegistrySections | Where-Object { Test-Path -Path Registry::$_ } | ForEach-Object {
+            $currentPath = $_
             try {
-                Get-ChildItem -Path Registry::$_ -ErrorAction SilentlyContinue | ForEach-Object {
+                Get-ChildItem -Path Registry::$currentPath -ErrorAction SilentlyContinue | ForEach-Object {
                     try {
                         $displayName = $_.GetValue("DisplayName")
                         if ($displayName -match $versionFilter) {
@@ -128,11 +129,11 @@ function Remove-RegistryEntries {
                     }
                 }
             } catch {
-                Write-Warning "Failed to enumerate uninstall registry section $_: $_"
+                Write-Warning "Failed to enumerate uninstall registry section ${currentPath}: $($_.Exception.Message)"
             }
         }
     } catch {
-        Write-Warning "Error during registry cleanup: $_"
+        Write-Warning "Error during registry cleanup: $($_.Exception.Message)"
         # Continue execution even if registry cleanup fails
     }
 }
@@ -182,7 +183,7 @@ function Test-PythonInstallation {
             return $true
         }
     } catch {
-        Write-Warning "Failed to verify Python installation: $_"
+        Write-Warning "Failed to verify Python installation: $($_.Exception.Message)"
     }
     return $false
 }
@@ -218,7 +219,7 @@ function Install-PythonWithRetry {
                 }
             }
         } catch {
-            Write-Warning "Installation attempt failed: $_"
+            Write-Warning "Installation attempt failed: $($_.Exception.Message)"
             if ($attempt -lt $MaxRetries) {
                 Start-Sleep -Seconds 5
             }
@@ -314,7 +315,7 @@ try {
             Write-Host "No existing Python $MajorVersion.$MinorVersion installations found."
         }
     } catch {
-        Write-Verbose "Error checking for existing installations: $_"
+        Write-Verbose "Error checking for existing installations: $($_.Exception.Message)"
     }
 
     # Clean up registry entries
@@ -406,7 +407,7 @@ try {
             Write-Warning "Pip upgrade returned exit code: $($upgradePipResult.ExitCode)"
         }
     } catch {
-        Write-Warning "Error during pip installation/upgrade: $_"
+        Write-Warning "Error during pip installation/upgrade: $($_.Exception.Message)"
         # Continue execution even if pip upgrade fails
     }
 
@@ -428,6 +429,6 @@ try {
     & $PythonExePath -m pip --version
 
 } catch {
-    Write-Error "Critical error during Python installation: $_"
+    Write-Error "Critical error during Python installation: $($_.Exception.Message)"
     exit 1
 }
